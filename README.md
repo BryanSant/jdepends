@@ -16,6 +16,14 @@ A fast, lightweight CLI tool to check for dependency and plugin updates in Java/
 
 ## Installation
 
+### Quick Install
+
+The easiest way to install `jdepends` as a native binary is to use the provided installation script. This script verifies your environment, builds the native image, and installs it to `~/.local/bin`.
+
+```bash
+./install.sh
+```
+
 ### Prerequisites
 
 - Java 25 or higher (for building/running the JAR).
