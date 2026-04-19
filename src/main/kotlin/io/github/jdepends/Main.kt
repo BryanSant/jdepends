@@ -1,21 +1,35 @@
 package io.github.jdepends
 
-import kotlinx.serialization.json.*
 import org.fusesource.jansi.Ansi.ansi
 import org.fusesource.jansi.AnsiConsole
+import org.w3c.dom.Element
+import java.io.File
 import java.net.URI
-import java.net.URLEncoder
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import javax.xml.parsers.DocumentBuilderFactory
 
 fun main(args: Array<String>) {
     if (System.console() != null) System.setProperty("jansi.force", "true")
     AnsiConsole.systemInstall()
+
     if (args.isEmpty()) {
+        val deps = detectAndResolveDependencies()
+        if (deps != null) {
+            if (deps.isEmpty()) {
+                System.err.println("No dependencies found")
+                return
+            }
+            for ((groupId, artifactId, version) in deps) {
+                checkDependency(groupId, artifactId, version)
+            }
+            return
+        }
         System.err.println("Usage: jdepends <groupId>:<artifactId>[:<version>]")
         System.err.println("  e.g. jdepends io.micronaut:micronaut-http-server-netty")
         System.err.println("  e.g. jdepends org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
+        System.err.println("  Or run in a directory with build.gradle[.kts] or pom.xml")
         System.exit(1)
     }
 
@@ -27,22 +41,129 @@ fun main(args: Array<String>) {
         System.exit(1)
     }
 
-    val groupId = parts[0]
-    val artifactId = parts[1]
-    val suppliedVersion = if (parts.size >= 3) parts[2] else null
+    checkDependency(parts[0], parts[1], if (parts.size >= 3) parts[2] else null)
+}
 
+private data class Dependency(val groupId: String, val artifactId: String, val version: String?)
+
+private fun detectAndResolveDependencies(): List<Dependency>? {
+    val dir = File(".")
+    return when {
+        dir.resolve("build.gradle.kts").exists() || dir.resolve("build.gradle").exists() ->
+            runGradle()
+        dir.resolve("pom.xml").exists() ->
+            runMaven()
+        else -> null
+    }
+}
+
+// ── Gradle ────────────────────────────────────────────────────────────────────
+
+private fun runGradle(): List<Dependency> {
+    val cmd = if (File("gradlew").exists()) "./gradlew" else "gradle"
+    // runtimeClasspath captures the actual resolved deps; fall back to all configs if unavailable
+    for (args in listOf(
+        listOf(cmd, "dependencies", "--configuration", "runtimeClasspath"),
+        listOf(cmd, "dependencies", "--configuration", "compileClasspath"),
+        listOf(cmd, "dependencies"),
+    )) {
+        val process = ProcessBuilder(args)
+            .directory(File("."))
+            .redirectErrorStream(true)
+            .start()
+        val output = process.inputStream.bufferedReader().readText()
+        if (process.waitFor() == 0) return parseGradleOutput(output)
+        if ("Configuration with name" !in output) {
+            System.err.println("gradle dependencies failed:\n$output")
+            return emptyList()
+        }
+        // configuration not found — try next fallback
+    }
+    return emptyList()
+}
+
+private fun parseGradleOutput(output: String): List<Dependency> {
+    // Matches tree lines: "+--- group:artifact:version" and variants:
+    //   - "group:artifact:version -> resolvedVersion"   (conflict-resolved)
+    //   - "group:artifact:{strictly X} -> resolvedVersion"  (rich version)
+    //   - trailing "(*)","(c)","(n)" markers
+    val coordRe = Regex("""--- ([A-Za-z0-9._-]+:[A-Za-z0-9._-]+):([^\s(]+)(?:\s+->\s+([A-Za-z0-9._\-+]+))?""")
+    val validVersion = Regex("""[A-Za-z0-9._\-+]+""")
+
+    return output.lines()
+        .filter { "--- " in it }
+        .mapNotNull { line ->
+            // (n) = unresolved declaration, (c) = BOM constraint — skip both
+            if (line.trimEnd().endsWith("(n)") || line.trimEnd().endsWith("(c)")) return@mapNotNull null
+            val m = coordRe.find(line) ?: return@mapNotNull null
+            val coord = m.groupValues[1].split(":")
+            val declared = m.groupValues[2]
+            val resolved = m.groupValues[3].ifEmpty { null }
+            // Prefer the resolved version; fall back to declared only if it's a plain version string
+            val version = resolved ?: run {
+                if (validVersion.matches(declared)) declared else return@mapNotNull null
+            }
+            Dependency(coord[0], coord[1], version)
+        }
+        .distinctBy { "${it.groupId}:${it.artifactId}" }
+}
+
+// ── Maven ─────────────────────────────────────────────────────────────────────
+
+private fun runMaven(): List<Dependency> {
+    val cmd = if (File("mvnw").exists()) "./mvnw" else "mvn"
+    val process = ProcessBuilder(cmd, "help:effective-pom")
+        .directory(File("."))
+        .redirectErrorStream(true)
+        .start()
+    val output = process.inputStream.bufferedReader().readText()
+    if (process.waitFor() != 0) {
+        System.err.println("mvn help:effective-pom failed:\n$output")
+        return emptyList()
+    }
+    return parseMavenEffectivePom(output)
+}
+
+private fun parseMavenEffectivePom(output: String): List<Dependency> {
+    // The command prints Maven log lines before/after the XML — extract just the XML.
+    val xmlStart = output.indexOf("<?xml")
+    if (xmlStart == -1) return emptyList()
+    val xmlEnd = output.indexOf("</project>", xmlStart)
+    if (xmlEnd == -1) return emptyList()
+    val xml = output.substring(xmlStart, xmlEnd + "</project>".length)
+
+    return try {
+        val factory = DocumentBuilderFactory.newInstance().also { it.isNamespaceAware = false }
+        val doc = factory.newDocumentBuilder().parse(xml.byteInputStream())
+        val nodes = doc.getElementsByTagName("dependency")
+        (0 until nodes.length).mapNotNull { i ->
+            val dep = nodes.item(i) as Element
+            // Skip entries inside <dependencyManagement> — those are version constraints, not real deps
+            if (dep.parentNode?.parentNode?.nodeName == "dependencyManagement") return@mapNotNull null
+            val groupId = dep.getElementsByTagName("groupId").item(0)?.textContent ?: return@mapNotNull null
+            val artifactId = dep.getElementsByTagName("artifactId").item(0)?.textContent ?: return@mapNotNull null
+            val version = dep.getElementsByTagName("version").item(0)?.textContent
+            Dependency(groupId, artifactId, version)
+        }.distinctBy { "${it.groupId}:${it.artifactId}" }
+    } catch (e: Exception) {
+        System.err.println("Failed to parse effective POM: ${e.message}")
+        emptyList()
+    }
+}
+
+// ── Version check ─────────────────────────────────────────────────────────────
+
+private fun checkDependency(groupId: String, artifactId: String, suppliedVersion: String?) {
     val versions = fetchVersions(groupId, artifactId)
-
     if (versions.isEmpty()) {
         System.err.println("No versions found for $groupId:$artifactId")
-        System.exit(1)
+        return
     }
 
     val sorted = versions.sortedWith(VersionComparator.reversed())
     val recent = sorted.take(8)
 
-    val latestVersion = sorted.firstOrNull { VersionComparator.isStableRelease(it) }
-        ?: recent.first()
+    val latestVersion = sorted.firstOrNull { VersionComparator.isStableRelease(it) } ?: recent.first()
     val latestFormatted = if (suppliedVersion != null && suppliedVersion == latestVersion)
         ansi().bold().fgBright(org.fusesource.jansi.Ansi.Color.GREEN).a(latestVersion).reset()
     else
@@ -57,12 +178,12 @@ fun main(args: Array<String>) {
             org.fusesource.jansi.Ansi.Color.WHITE
         ":" + ansi().bold().fgBright(color).a(suppliedVersion).reset()
     } else ""
-    println("$groupId:$artifactId$suppliedFormatted [$latestFormatted$rest]")
+    IO.println("📦 $groupId:$artifactId$suppliedFormatted [$latestFormatted$rest]")
 }
 
 private fun fetchVersions(groupId: String, artifactId: String): List<String> {
-    val query = URLEncoder.encode("""g:"$groupId" AND a:"$artifactId"""", Charsets.UTF_8)
-    val url = "https://search.maven.org/solrsearch/select?q=$query&core=gav&rows=200&wt=json"
+    val groupPath = groupId.replace('.', '/')
+    val url = "https://repo1.maven.org/maven2/$groupPath/$artifactId/maven-metadata.xml"
 
     val client = HttpClient.newBuilder()
         .followRedirects(HttpClient.Redirect.NORMAL)
@@ -77,16 +198,19 @@ private fun fetchVersions(groupId: String, artifactId: String): List<String> {
     val response = client.send(request, HttpResponse.BodyHandlers.ofString())
 
     if (response.statusCode() != 200) {
-        error("Maven Central returned HTTP ${response.statusCode()}")
+        System.err.println("Maven Central returned HTTP ${response.statusCode()} for $groupId:$artifactId")
+        return emptyList()
     }
 
-    val json = Json.parseToJsonElement(response.body())
-    val docs = json.jsonObject["response"]
-        ?.jsonObject?.get("docs")
-        ?.jsonArray
-        ?: return emptyList()
-
-    return docs.mapNotNull { it.jsonObject["v"]?.jsonPrimitive?.content }
+    return try {
+        val factory = DocumentBuilderFactory.newInstance().also { it.isNamespaceAware = false }
+        val doc = factory.newDocumentBuilder().parse(response.body().byteInputStream())
+        val nodes = doc.getElementsByTagName("version")
+        (0 until nodes.length).map { nodes.item(it).textContent }
+    } catch (e: Exception) {
+        System.err.println("Failed to parse metadata for $groupId:$artifactId: ${e.message}")
+        emptyList()
+    }
 }
 
 /**

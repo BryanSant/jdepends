@@ -1,8 +1,7 @@
 plugins {
     kotlin("jvm") version "2.3.20"
-    kotlin("plugin.serialization") version "2.3.20"
-    application
     id("com.gradleup.shadow") version "9.4.1"
+    application
 }
 
 group = "io.github.jdepends"
@@ -17,7 +16,6 @@ repositories {
 }
 
 dependencies {
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
     implementation("org.fusesource.jansi:jansi:2.4.3")
 }
 
