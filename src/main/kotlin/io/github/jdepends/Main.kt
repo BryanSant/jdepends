@@ -14,37 +14,42 @@ fun main(args: Array<String>) {
     if (System.console() != null) System.setProperty("jansi.force", "true")
     AnsiConsole.systemInstall()
 
-    if (args.isEmpty()) {
-        val deps = detectAndResolveDependencies()
-        if (deps != null) {
-            if (deps.isEmpty()) {
+    val allFlag = "-a" in args || "--all" in args
+    val positionalArgs = args.filter { it != "-a" && it != "--all" }
+
+    if (positionalArgs.isEmpty()) {
+        val plugins = detectGradlePlugins()
+        val deps = if (allFlag) detectAndResolveDependencies() else detectDeclaredDependencies()
+        if (plugins.isNotEmpty() || deps != null) {
+            if (plugins.isEmpty() && (deps == null || deps.isEmpty())) {
                 System.err.println("No dependencies found")
                 return
             }
-            for ((groupId, artifactId, version) in deps) {
-                checkDependency(groupId, artifactId, version)
-            }
+            plugins.forEach { (id, version) -> checkPlugin(id, version) }
+            deps?.forEach { (groupId, artifactId, version) -> checkDependency(groupId, artifactId, version) }
             return
         }
-        System.err.println("Usage: jdepends <groupId>:<artifactId>[:<version>]")
+        System.err.println("Usage: jdepends [-a|--all] <groupId>:<artifactId>[:<version>]")
+        System.err.println("  -a, --all  Check all resolved/transitive dependencies (not just declared)")
         System.err.println("  e.g. jdepends io.micronaut:micronaut-http-server-netty")
         System.err.println("  e.g. jdepends org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
         System.err.println("  Or run in a directory with build.gradle[.kts] or pom.xml")
         System.exit(1)
     }
 
-    val input = args[0].trim()
-    val parts = input.split(":")
+    val input = positionalArgs[0].trim()
 
-    if (parts.size < 2) {
-        System.err.println("Invalid input '$input'. Expected <groupId>:<artifactId>[:<version>]")
-        System.exit(1)
+    if (!input.contains(':')) {
+        checkPlugin(input, null)
+        return
     }
 
+    val parts = input.split(":")
     checkDependency(parts[0], parts[1], if (parts.size >= 3) parts[2] else null)
 }
 
 private data class Dependency(val groupId: String, val artifactId: String, val version: String?)
+private data class PluginDep(val id: String, val version: String?)
 
 private fun detectAndResolveDependencies(): List<Dependency>? {
     val dir = File(".")
@@ -55,6 +60,219 @@ private fun detectAndResolveDependencies(): List<Dependency>? {
             runMaven()
         else -> null
     }
+}
+
+private fun detectDeclaredDependencies(): List<Dependency>? {
+    val dir = File(".")
+    val buildKts = dir.resolve("build.gradle.kts")
+    val buildGroovy = dir.resolve("build.gradle")
+    val pom = dir.resolve("pom.xml")
+
+    val buildDeps: List<Dependency>? = when {
+        buildKts.exists() -> parseGradleDeclaredDependencies(buildKts)
+        buildGroovy.exists() -> parseGradleDeclaredDependencies(buildGroovy)
+        pom.exists() -> parseMavenDeclaredDependencies(pom)
+        else -> null
+    }
+
+    val catalog = findVersionCatalog(dir)
+    if (catalog != null) {
+        val (catalogDeps, _) = parseVersionCatalog(catalog)
+        return ((buildDeps ?: emptyList()) + catalogDeps)
+            .distinctBy { "${it.groupId}:${it.artifactId}" }
+    }
+
+    return buildDeps
+}
+
+private fun parseGradleDeclaredDependencies(file: File): List<Dependency> {
+    val content = file.readText()
+
+    // Find the dependencies block using balanced brace matching
+    val startMatch = Regex("""(?m)^dependencies\s*\{""").find(content) ?: return emptyList()
+    val blockStart = startMatch.range.last
+    var depth = 1
+    var i = blockStart + 1
+    while (i < content.length && depth > 0) {
+        when (content[i]) {
+            '{' -> depth++
+            '}' -> depth--
+        }
+        i++
+    }
+    val depsBlock = content.substring(blockStart + 1, i - 1)
+
+    val result = mutableListOf<Dependency>()
+    val plainVersion = Regex("""[A-Za-z0-9._\-+]+""")
+
+    // Match coordinate strings: "group:artifact:version" or "group:artifact"
+    val coordRe = Regex("""["']([A-Za-z0-9._-]+:[A-Za-z0-9._-]+)(?::([^"']+))?["']""")
+    coordRe.findAll(depsBlock).forEach { m ->
+        val parts = m.groupValues[1].split(":")
+        if (parts.size == 2) {
+            val rawVersion = m.groupValues[2].ifEmpty { null }
+            // Skip version if it's a variable/expression (contains $, spaces, etc.)
+            val version = if (rawVersion != null && plainVersion.matches(rawVersion)) rawVersion else null
+            result += Dependency(parts[0], parts[1], version)
+        }
+    }
+
+    return result.distinctBy { "${it.groupId}:${it.artifactId}" }
+}
+
+// ── Version catalog (gradle/libs.versions.toml) ──────────────────────────────
+
+private fun findVersionCatalog(startDir: File = File(".")): File? {
+    var dir = startDir.canonicalFile
+    while (true) {
+        val catalog = dir.resolve("gradle/libs.versions.toml")
+        if (catalog.exists()) return catalog
+        val parent = dir.parentFile ?: return null
+        if (parent == dir) return null
+        dir = parent
+    }
+}
+
+private fun parseVersionCatalog(file: File): Pair<List<Dependency>, List<PluginDep>> {
+    val versions = mutableMapOf<String, String>()
+    val libraries = mutableListOf<Dependency>()
+    val plugins = mutableListOf<PluginDep>()
+    var section = ""
+
+    for (rawLine in file.readLines()) {
+        val line = rawLine.trim()
+        if (line.startsWith("#") || line.isEmpty()) continue
+
+        val sectionMatch = Regex("""^\[([^\]]+)]""").find(line)
+        if (sectionMatch != null) {
+            section = sectionMatch.groupValues[1].trim()
+            continue
+        }
+
+        val eqIdx = line.indexOf('=')
+        if (eqIdx < 0) continue
+        val key = line.substring(0, eqIdx).trim()
+        val value = line.substring(eqIdx + 1).trim()
+
+        when (section) {
+            "versions" -> versions[key] = value.trim('"', '\'')
+            "libraries" -> parseCatalogLibrary(value, versions)?.let { libraries += it }
+            "plugins" -> parseCatalogPlugin(value, versions)?.let { plugins += it }
+        }
+    }
+
+    return libraries.distinctBy { "${it.groupId}:${it.artifactId}" } to
+        plugins.distinctBy { it.id }
+}
+
+private fun parseCatalogLibrary(value: String, versions: Map<String, String>): Dependency? {
+    if (value.startsWith("\"") || value.startsWith("'")) {
+        // String notation: "group:artifact:version"
+        val parts = value.trim('"', '\'').split(":")
+        if (parts.size < 2) return null
+        return Dependency(parts[0], parts[1], parts.getOrNull(2))
+    }
+    if (!value.startsWith("{")) return null
+    val module = extractTomlField(value, "module")
+    val group  = extractTomlField(value, "group")
+    val name   = extractTomlField(value, "name")
+    val (groupId, artifactId) = if (module != null) {
+        val parts = module.split(":")
+        if (parts.size < 2) return null
+        parts[0] to parts[1]
+    } else if (group != null && name != null) {
+        group to name
+    } else return null
+    val version = extractTomlField(value, "version.ref")?.let { versions[it] }
+        ?: extractTomlField(value, "version")
+    return Dependency(groupId, artifactId, version)
+}
+
+private fun parseCatalogPlugin(value: String, versions: Map<String, String>): PluginDep? {
+    if (!value.startsWith("{")) return null
+    val id = extractTomlField(value, "id") ?: return null
+    val version = extractTomlField(value, "version.ref")?.let { versions[it] }
+        ?: extractTomlField(value, "version")
+    return PluginDep(id, version)
+}
+
+/** Extracts a quoted string value for [fieldName] from a TOML inline table.
+ *  When [fieldName] is "version", avoids matching "version.ref". */
+private fun extractTomlField(inlineTable: String, fieldName: String): String? {
+    val pattern = if (fieldName == "version")
+        """version(?!\.ref)\s*=\s*["']([^"']+)["']"""
+    else
+        """${Regex.escape(fieldName)}\s*=\s*["']([^"']+)["']"""
+    return Regex(pattern).find(inlineTable)?.groupValues?.get(1)
+}
+
+private fun parseMavenDeclaredDependencies(file: File): List<Dependency> {
+    return try {
+        val factory = DocumentBuilderFactory.newInstance().also { it.isNamespaceAware = false }
+        val doc = factory.newDocumentBuilder().parse(file)
+        val nodes = doc.getElementsByTagName("dependency")
+        (0 until nodes.length).mapNotNull { i ->
+            val dep = nodes.item(i) as Element
+            if (dep.parentNode?.parentNode?.nodeName == "dependencyManagement") return@mapNotNull null
+            val groupId = dep.getElementsByTagName("groupId").item(0)?.textContent ?: return@mapNotNull null
+            val artifactId = dep.getElementsByTagName("artifactId").item(0)?.textContent ?: return@mapNotNull null
+            val version = dep.getElementsByTagName("version").item(0)?.textContent
+            // Skip property-reference versions like ${some.version}
+            val resolvedVersion = if (version != null && !version.contains('$')) version else null
+            Dependency(groupId, artifactId, resolvedVersion)
+        }.distinctBy { "${it.groupId}:${it.artifactId}" }
+    } catch (e: Exception) {
+        System.err.println("Failed to parse pom.xml: ${e.message}")
+        emptyList()
+    }
+}
+
+// ── Gradle plugins ────────────────────────────────────────────────────────────
+
+private fun detectGradlePlugins(): List<PluginDep> {
+    val dir = File(".")
+    val buildFile = dir.resolve("build.gradle.kts").takeIf { it.exists() }
+        ?: dir.resolve("build.gradle").takeIf { it.exists() }
+
+    val buildPlugins = buildFile?.let { parseGradlePlugins(it) } ?: emptyList()
+
+    val catalog = findVersionCatalog(dir)
+    if (catalog != null) {
+        val (_, catalogPlugins) = parseVersionCatalog(catalog)
+        return (buildPlugins + catalogPlugins).distinctBy { it.id }
+    }
+
+    return buildPlugins
+}
+
+private fun parseGradlePlugins(file: File): List<PluginDep> {
+    val content = file.readText()
+    val pluginsBlock = Regex("""plugins\s*\{([^}]*)\}""", RegexOption.DOT_MATCHES_ALL)
+        .find(content)?.groupValues?.get(1) ?: return emptyList()
+
+    val result = mutableListOf<PluginDep>()
+
+    // id("pluginId") version "version"  (Kotlin DSL)
+    Regex("""id\(["']([^"']+)["']\)\s+version\s+["']([^"']+)["']""")
+        .findAll(pluginsBlock)
+        .forEach { result += PluginDep(it.groupValues[1], it.groupValues[2]) }
+
+    // kotlin("suffix") version "version"  →  org.jetbrains.kotlin.<suffix>
+    Regex("""kotlin\(["']([^"']+)["']\)\s+version\s+["']([^"']+)["']""")
+        .findAll(pluginsBlock)
+        .forEach { result += PluginDep("org.jetbrains.kotlin.${it.groupValues[1]}", it.groupValues[2]) }
+
+    // id 'pluginId' version 'version'  (Groovy DSL)
+    if (!file.name.endsWith(".kts")) {
+        Regex("""id\s+["']([^"']+)["']\s+version\s+["']([^"']+)["']""")
+            .findAll(pluginsBlock)
+            .forEach { m ->
+                if (result.none { it.id == m.groupValues[1] })
+                    result += PluginDep(m.groupValues[1], m.groupValues[2])
+            }
+    }
+
+    return result.distinctBy { it.id }
 }
 
 // ── Gradle ────────────────────────────────────────────────────────────────────
@@ -151,6 +369,46 @@ private fun parseMavenEffectivePom(output: String): List<Dependency> {
     }
 }
 
+// ── Plugin version check ──────────────────────────────────────────────────────
+
+private fun fetchLatestPluginVersion(pluginId: String): String? {
+    val url = "https://plugins.gradle.org/plugin/$pluginId"
+    val client = HttpClient.newBuilder()
+        .followRedirects(HttpClient.Redirect.NORMAL)
+        .build()
+    val request = HttpRequest.newBuilder()
+        .uri(URI.create(url))
+        .header("User-Agent", "jdepends/1.0")
+        .GET()
+        .build()
+    val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+    if (response.statusCode() != 200) {
+        System.err.println("plugins.gradle.org returned HTTP ${response.statusCode()} for $pluginId")
+        return null
+    }
+    return Regex("""<p[^>]*\bid=["']?plugin-id-version["']?[^>]*>([^<]+)</p>""")
+        .find(response.body())?.groupValues?.get(1)?.trim()
+}
+
+private fun checkPlugin(pluginId: String, currentVersion: String?) {
+    val latestVersion = fetchLatestPluginVersion(pluginId) ?: run {
+        System.err.println("No version found for plugin $pluginId")
+        return
+    }
+    val latestFormatted = if (currentVersion == latestVersion)
+        ansi().bold().fgBright(org.fusesource.jansi.Ansi.Color.GREEN).a(latestVersion).reset()
+    else
+        ansi().bold().fgBright(org.fusesource.jansi.Ansi.Color.WHITE).a(latestVersion).reset()
+    val suppliedFormatted = if (currentVersion != null) {
+        val color = if (currentVersion == latestVersion)
+            org.fusesource.jansi.Ansi.Color.GREEN
+        else
+            org.fusesource.jansi.Ansi.Color.WHITE
+        ":" + ansi().bold().fgBright(color).a(currentVersion).reset()
+    } else ""
+    println("🔌 $pluginId$suppliedFormatted [$latestFormatted]")
+}
+
 // ── Version check ─────────────────────────────────────────────────────────────
 
 private fun checkDependency(groupId: String, artifactId: String, suppliedVersion: String?) {
@@ -178,7 +436,7 @@ private fun checkDependency(groupId: String, artifactId: String, suppliedVersion
             org.fusesource.jansi.Ansi.Color.WHITE
         ":" + ansi().bold().fgBright(color).a(suppliedVersion).reset()
     } else ""
-    IO.println("📦 $groupId:$artifactId$suppliedFormatted [$latestFormatted$rest]")
+    println("📦 $groupId:$artifactId$suppliedFormatted [$latestFormatted$rest]")
 }
 
 private fun fetchVersions(groupId: String, artifactId: String): List<String> {

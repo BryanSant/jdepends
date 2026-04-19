@@ -1,6 +1,7 @@
 plugins {
     kotlin("jvm") version "2.3.20"
     id("com.gradleup.shadow") version "9.4.1"
+    id("org.graalvm.buildtools.native") version "0.10.4"
     application
 }
 
@@ -44,8 +45,33 @@ tasks.named("startShadowScripts") {
     dependsOn(tasks.jar)
 }
 
+graalvmNative {
+    binaries {
+        named("main") {
+            buildArgs.add("--enable-native-access=ALL-UNNAMED")
+        }
+    }
+}
+
 tasks.jar {
     manifest {
         attributes["Main-Class"] = "io.github.jdepends.MainKt"
+    }
+}
+
+graalvmNative {
+    binaries {
+        named("main") {
+            imageName.set("jdepends")
+            mainClass.set("io.github.jdepends.MainKt")
+            buildArgs.addAll(
+                "--no-fallback",
+                "-H:+ReportExceptionStackTraces",
+                "--initialize-at-run-time=org.fusesource.jansi,org.fusesource.hawtjni"
+            )
+        }
+    }
+    metadataRepository {
+        enabled.set(true)
     }
 }
